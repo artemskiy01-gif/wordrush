@@ -1,3 +1,12 @@
+# Local source snapshots, installed dependencies, caches and study probes.
+.audit/
 node_modules/
 .env
+.env.*.local
+.data/
+coverage/
+*.log
 .DS_Store
+# User handoff documents and the original local study are reference material.
+PROJECT_STUDY.md
+docs/reference/

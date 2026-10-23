@@ -1,62 +1,97 @@
-# WordRush — mini live Kahoot for vocabulary classes
+# WordRush 2.0
 
-A working realtime **multiplayer** English vocabulary quiz (Node.js + Socket.IO) — *not* an offline simulation.
+A real-time classroom quiz platform, upgraded from the original WordRush vocabulary game. Teachers have their own accounts and private quiz library. Students join on their phones with a six-digit PIN and a nickname.
 
-**Students:** open the shared website → enter the six-digit PIN → type their nickname → wait in the lobby → answer live questions on their own phones. After the final round, see the **top-three podium**, and when the teacher presses Next, the **full class ranking**.
+## Run locally
 
-**Teacher:** open `/teacher` → enter the teacher password → choose a quiz pack → create live game → share PIN → press Start → press Next to reveal/advance questions, show the podium, then show the full leaderboard. There is deliberately **no quiz-authoring dashboard**.
+Use Node.js 20+ (Node 22 recommended).
 
-## Running it in Replit
-
-1. Upload the files from this project into a Node.js Replit project (or import the ZIP).
-2. In **Secrets**, add `TEACHER_PASSWORD` with a long private password. Do not put this password in code or give it to students.
-3. Run `npm install`, then `npm start`. Replit can install dependencies automatically when you run the project.
-4. Open the public web preview: `/teacher` is your control page, `/` is the student join page.
-5. **Deploy with an always-on web deployment** to get a stable, public HTTPS URL that students can use on their phones. A local preview on your computer alone won't work on their phones. Follow the deployment flow in your current Replit account; paid hosting may be required.
-6. If deployment uses multiple instances, configure **one server instance**, since rooms are currently stored in memory (not a shared database).
-
-### Run on your own computer
-
-Requires Node.js 20+. Run `npm install`, then on macOS/Linux `TEACHER_PASSWORD='choose-a-secret' npm start`; on Windows PowerShell `$env:TEACHER_PASSWORD='choose-a-secret'; npm start`. Visit `http://localhost:3000/teacher` and `http://localhost:3000`. For mobile devices, use a public deployment, or access the computer over its local network IP if your firewall allows it.
-
-If you do not set `TEACHER_PASSWORD`, a random temporary teacher password is printed in the **server logs on each launch**. For deployment always set a secret.
-
-## Add future vocabulary quizzes — no teacher quiz builder
-
-Each vocabulary game is **one JSON file** in `quizzes/`. Request a quiz from ChatGPT and have it generate a new JSON file following the existing example; put that file in this folder and redeploy/restart. Once your Replit project is available to ChatGPT via compatible connected editing tools, quiz files may be added directly through that integration; this cannot be assumed without tool access.
-
-Quiz file structure:
-
-```json
-{
-  "id": "beginner-9a",
-  "title": "English File Beginner — 9A",
-  "subtitle": "Vocabulary review",
-  "duration": 20,
-  "questions": [
-    {
-      "prompt": "What does 'take photos' mean?",
-      "options": ["Фотографировать", "Рисовать", "Писать", "Читать"],
-      "correct": 0
-    }
-  ]
-}
+```sh
+npm ci
+npm start
 ```
 
-* `duration` is 5–120 seconds per question. The correct answer uses a zero-based index `0` to `3`.
-* All students see the **same question/choice order** in a room. You can include up to 100 questions per quiz. The game auto-reveals when the timer expires or all currently registered students have answered; pressing Next while a question is live reveals immediately.
-* Scoring: **0** for an incorrect answer; **500 to 1,000 points** for a correct answer depending on how quickly they respond. On a tie in points, most correct answers wins, then earlier join time.
-* A player may answer **once** per question. The server, not the student's phone, calculates points and deadlines.
+Open [WordRush](http://localhost:3000) for students or [Sign up](http://localhost:3000/signup) to create a teacher account. Accounts, quizzes, login sessions and games persist in `.data/postgres`. A private development session secret is generated in `.data/session-secret`; do not publish `.data/`. No teacher account or shared password is preconfigured.
 
-## Important limitations
+Local storage uses PGlite, an embedded PostgreSQL implementation. It is a development convenience; production requires an external PostgreSQL database. Only one local process should open the local data directory at a time. Local mobile access can use the computer's LAN address if its firewall permits it; public classroom use needs HTTPS hosting.
 
-* The MVP stores active games and scores in **server memory**. Restarting the app or redeploying during class **ends live rooms and erases current scores**. New classes create new PINs. A database would be a future improvement.
-* The host and players can **reconnect or refresh** during a session, as long as the server hasn't restarted and the browser keeps its local storage.
-* Maximum **80 students per room**, intended for ordinary classroom sizes, not a production-scale service.
-* Names are displayed on classmates' phones and should be first names or pseudonyms only. No email or password for students.
-* No student self-serve quiz building or teacher question editor (by design).
-* Not yet hosted by ChatGPT; deployment is separate from the provided source code.
+Optional settings can go in `.env`; see `.env.example`. PowerShell supports a custom port with `$env:PORT='3137'` before `npm start`.
 
-## Testing
+## Teacher workflow
 
-Run `npm test` after `npm install`. Tests cover quiz validity, room creation, joining, answers, scoring, and podium/ranking sequence.
+1. Sign up with your display name, email and password (12+ characters).
+2. Create a quiz, or explicitly add the original Holidays sample to your library.
+3. Add multiple-choice or True/False questions, choose correct answers and set individual timers.
+4. Add, duplicate, delete or reorder questions using the up/down buttons.
+5. Save a draft at any time. Changes also autosave after a short pause and have local recovery protection.
+6. Publish when the quiz is complete. Publication keeps the quiz private; it does not start a game.
+7. Click Host live. Complete saved drafts can also be hosted.
+8. Share the student URL and PIN. Press Start when students are ready.
+9. Advance after each reveal. The podium appears first; press Next to show everyone's ranking, then finish the game.
+
+Editing a published quiz returns the edited version to draft when autosaved. Publish again when ready. A game already in progress keeps its own immutable quiz copy. Deleting a quiz does not remove the game's captured questions.
+
+The editor clearly reports unsaved, saving, saved, validation and network states. If a different tab saved the same quiz, an outdated revision cannot overwrite it. Unsaved recovery content stays only in that teacher's browser profile and is removed on logout. Avoid shared browser profiles when preparing private quiz content.
+
+## Multiplayer behavior
+
+- Server-authoritative countdowns, one answer per question and 500–1,000 points for a correct answer based on speed.
+- Multiple-choice has exactly four buttons; True/False has exactly two.
+- Students reconnect with their existing identity, answers and score.
+- Teacher control is checked against their account and room ownership for every socket action.
+- Answers include question and phase identifiers; duplicate Start/Next commands cannot skip stages.
+- Correct answers and current-question score changes are hidden until reveal.
+- Durable snapshots restore rooms after a server restart. Deadlines continue during downtime, so an expired question restores at reveal.
+- Each room supports 80 students. Multiple teachers can host separate rooms in the single application process.
+
+## Database and migrations
+
+For production, set `DATABASE_URL` to your PostgreSQL connection string. Follow the provider's TLS/certificate instructions; the application does not turn off certificate verification.
+
+```sh
+npm run migrate
+```
+
+Migrations also run on application startup. Applied filenames are recorded in `schema_migrations`; new schema changes belong in new migration files. Back up the database through your provider before applying future migrations. The production schema contains teacher accounts, database-backed login sessions, private quiz documents, and game snapshots/answers. See [Architecture](docs/ARCHITECTURE.md).
+
+The existing `quizzes/holidays-2a.json` remains intact. Add sample makes a teacher-owned copy after an explicit action. It is not assigned automatically to new users. Existing unpublished MVP live rooms cannot be migrated because the old application stored them only in process memory.
+
+## Production deployment
+
+`render.yaml` prepares a single Render Node web service. Configure:
+
+| Variable         | Value                                                                    |
+| ---------------- | ------------------------------------------------------------------------ |
+| `NODE_ENV`       | `production`                                                             |
+| `DATABASE_URL`   | Durable hosted PostgreSQL, with provider-required TLS settings           |
+| `SESSION_SECRET` | At least 32 random characters; keep the same secret across redeployments |
+| `APP_URL`        | Exact public HTTPS origin, e.g. `https://your-service.onrender.com`      |
+| `PORT`           | Supplied by hosting                                                      |
+
+Render Blueprint can generate `SESSION_SECRET`. Alternatively generate one locally using `node -e "console.log(require('node:crypto').randomBytes(48).toString('hex'))"` and enter it directly into the provider's secret settings. Never commit it. The old `TEACHER_PASSWORD` is unused and should be removed from hosting.
+
+Build with `npm ci --omit=dev`, start with `npm start`, and set the health check to `/health`. Bindings already use `0.0.0.0`. Run one instance: this version's durable room snapshots recover restarts, but its live coordination is not designed for multiple replicas.
+
+Render supports WebSockets. Its free web service can sleep after 15 minutes without inbound traffic and may take about a minute to wake. Local files are ephemeral. Free Render PostgreSQL expires after 30 days, so choose a durable database plan/provider for permanent teacher content. See [Render free-service limitations](https://render.com/docs/free) and [WebSocket hosting](https://render.com/docs/websocket). These provider rules were checked on 24 October 2026.
+
+After configuring hosting, verify the actual HTTPS URL, `/health`, signup/login, an independently joined student device, WebSocket transport, logout, a complete mixed-type quiz and restart recovery. Do not treat a local test or successful build as proof of production deployment. No paid service is required by the application itself; provider plans and limits are separate.
+
+## Security and privacy
+
+Passport Local, bcrypt and express-session provide password authentication and database-backed sessions. Production cookies use HttpOnly, SameSite=Lax and Secure. Mutations require a CSRF token; Origin validation, API/socket ownership checks, rate limiting, input validation, escaped output and Helmet headers are included. Session IDs rotate on login, and logout/expiration invalidates live host control.
+
+Students need no email or account. A room's nickname, answers and scores expire 24 hours after room creation and are removed by hourly cleanup (also at startup). Saved quizzes remain until their owner deletes them. Only the owner can inspect/control their game through teacher APIs. Nicknames and rankings are visible to participants in the same room.
+
+Password recovery, email verification, account administration, advanced analytics, payments, public quiz discovery and media questions are outside this release.
+
+## Validation
+
+```sh
+npm run check
+npm test
+npm audit
+```
+
+The portable test runner selects only the project's `tests/` directory; it does not rely on shell wildcard expansion. Tests use real embedded PostgreSQL and independent Socket.IO clients, covering authentication, ownership, drafts, publishing, large quizzes, immutable snapshots, timers, malformed input, question identities, duplicate actions, rankings and disk-backed restart recovery. CI is configured for Node 22 on Windows and Ubuntu.
+
+See [Implementation and verification](docs/IMPLEMENTATION.md) for actual results and remaining production checks. The earlier project study and supplied handoff documents remain local reference material.

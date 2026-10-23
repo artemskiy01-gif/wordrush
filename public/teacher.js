@@ -1,87 +1,134 @@
-'use strict';
-const socket=io();
-const screen=document.getElementById('teacher-screen');
-const STORAGE='wordrush:host';
-let state=null;
-const html=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const number=n=>Number(n||0).toLocaleString('en-US');
-const saved=()=>{try{return JSON.parse(localStorage.getItem(STORAGE))}catch{return null}};
-const save=x=>localStorage.setItem(STORAGE,JSON.stringify(x));
-async function loadQuizOptions(){
-  try{const r=await fetch('/api/quizzes');if(!r.ok)throw Error('Server error');const quizzes=await r.json();const sel=document.getElementById('quiz-selector');if(sel)sel.innerHTML=quizzes.map(q=>`<option value="${html(q.id)}">${html(q.title)} · ${q.questions} questions</option>`).join('');}
-  catch{const p=document.getElementById('teacher-error');if(p)p.textContent='Unable to load quiz packs. Reload the page.';}
+"use strict";
+const screen = document.getElementById("teacher-screen"),
+  h = WR.html,
+  n = WR.number;
+const pin = new URLSearchParams(location.search).get("pin");
+let socket,
+  state = null,
+  clockOffset = 0;
+function notify(text) {
+  document.getElementById("host-message").textContent = text || "";
 }
-function showLogin(){
-  state=null;
-  screen.innerHTML=`<section class="teacher-login-wrap"><form id="create-form" class="panel login-panel"><div class="eyebrow">YOUR CLASSROOM, YOUR GAME</div><h1>Let's play.</h1><p>Pick a vocabulary set and create a live room. Students join using the six-digit PIN.</p><label for="password">TEACHER PASSWORD</label><input id="password" type="password" placeholder="Teacher access password" autocomplete="current-password" required><label for="quiz-selector">VOCABULARY SET</label><select id="quiz-selector" required><option value="">Loading quizzes…</option></select><p id="teacher-error" class="error-message" role="alert"></p><button type="submit" class="primary-button" id="create-button">CREATE LIVE ROOM <span>→</span></button><div class="card-footnote">Only game controls — no quiz editor needed.</div></form></section>`;
-  loadQuizOptions();
-  document.getElementById('create-form').addEventListener('submit',e=>{
-    e.preventDefault();const btn=document.getElementById('create-button');btn.disabled=true;
-    const password=document.getElementById('password').value,quizId=document.getElementById('quiz-selector').value;
-    socket.timeout(8000).emit('host:create',{password,quizId},(err,r)=>{
-      btn.disabled=false;if(err||!r?.ok){document.getElementById('teacher-error').textContent=r?.message||'Could not create room.';return;}
-      save({pin:r.pin,hostToken:r.hostToken});
-    });
-  });
+function ranking(items) {
+  return `<div class="ranking-list">${items.map((p) => `<div class="rank-row"><span class="rank-position">#${p.rank}</span><span class="rank-name">${h(p.name)}</span><span class="rank-score">${n(p.score)} pts</span></div>`).join("")}</div>`;
 }
-function teacherNextLabel(){
-  if(!state)return 'NEXT';
-  if(state.status==='question')return 'REVEAL ANSWER →';
-  if(state.status==='reveal')return state.questionIndex+1===state.totalQuestions?'SHOW PODIUM 🏆':'NEXT QUESTION →';
-  if(state.status==='podium')return 'SHOW FULL RESULTS →';
-  return 'NEXT →';
+function podium(items) {
+  return `<div class="podium-grid">${[items[1], items[0], items[2]].map((p, i) => `<div class="podium-person ${["second", "first", "third"][i]}"><div class="podium-avatar">${["🥈", "👑", "🥉"][i]}</div><span class="podium-name">${h(p?.name || "—")}</span><span class="podium-score">${p ? n(p.score) + " points" : ""}</span><div class="podium-block">${[2, 1, 3][i]}</div></div>`).join("")}</div>`;
 }
-function makeRanking(items){return `<div class="ranking-list">${items.map(p=>`<div class="rank-row"><span class="rank-position">#${p.rank}</span><span class="rank-name">${html(p.name)}</span><span class="rank-score">${number(p.score)} pts</span></div>`).join('')}</div>`}
-function render(){
-  if(!state)return;
-  const s=state,count=s.players.length,connected=s.players.filter(p=>p.connected).length;
-  let quiz='',controls='';
-  if(s.status==='lobby'){
-    quiz=`<div class="teacher-cards"><div class="teacher-card"><div class="tiny-cap">STUDENTS IN LOBBY</div><div class="teacher-stat">${count}</div><p class="teacher-hint">${connected} online · new students appear automatically</p></div><div class="teacher-card"><div class="tiny-cap">JOIN ADDRESS</div><h3>${html(location.host)}</h3><p class="teacher-hint">Share the website and the six-digit PIN. Or copy the join link.</p><button class="secondary-button" id="copy-link">COPY STUDENT LINK ↗</button></div></div><div class="teacher-card"><h3>Who's here?</h3><div class="teacher-avatar-tags">${count?s.players.map(p=>`<span class="student-tag ${p.connected?'':'offline'}">${html(p.name)} ${p.connected?'✓':'· offline'}</span>`).join(''):'<p class="teacher-hint">Waiting for the first student to enter their PIN…</p>'}</div></div>`;
-    controls=`<button class="primary-button" id="game-start" ${count?'':'disabled'}>START GAME <span>→</span></button>`;
-  }else if(s.status==='question'||s.status==='reveal'){
-    const q=s.question,done=s.status==='reveal';
-    quiz=`<div class="teacher-cards"><div class="teacher-card"><div class="tiny-cap">QUESTION ${q.number} / ${q.total}</div><div class="teacher-stat" id="timer-seconds">${done?'0':'--'}s</div><div class="timer-bar"><div class="timer-fill" id="timer-fill" style="width:${done?0:100}%"></div></div></div><div class="teacher-card"><div class="tiny-cap">ANSWERS RECEIVED</div><div class="teacher-stat">${s.players.filter(p=>p.answered).length}<span style="font-size:22px;color:#a3abc5"> / ${count}</span></div><p class="teacher-hint">${connected} currently connected</p></div></div><div class="teacher-card"><div class="tiny-cap">${done?'CORRECT ANSWER REVEALED':'LIVE QUESTION'}</div><h2>${html(q.prompt)}</h2><div class="teacher-answers">${q.options.map((x,i)=>`<div class="answer-option-${i} ${done&&s.reveal.correct===i?'correct-choice':''}"><span>${['◆','▲','●','■'][i]} ${html(x)}</span><span>${done?s.reveal.counts[i]+' votes':''}</span></div>`).join('')}</div></div>`;
-    controls=`<button class="primary-button" id="game-next">${teacherNextLabel()} <span>→</span></button>`;
-  }else if(s.status==='podium'){
-    quiz=`<div class="teacher-card" style="text-align:center"><div class="tiny-cap">🏆 TOP 3 STUDENTS</div><h2 style="font:800 45px 'Space Grotesk'">The Podium!</h2>${makeRanking(s.ranking)}</div>`;
-    controls=`<button class="primary-button" id="game-next">SHOW FULL RESULTS <span>→</span></button>`;
-  }else if(s.status==='leaderboard'){
-    quiz=`<div class="teacher-card"><div class="tiny-cap">COMPLETE CLASS RANKING</div><h2 style="font:800 42px 'Space Grotesk'">Final Results</h2>${makeRanking(s.ranking)}</div>`;
-    controls=`<button class="secondary-button" id="new-game">CREATE ANOTHER ROOM ↗</button>`;
+function render() {
+  if (!state) return;
+  const s = state,
+    count = s.players.length,
+    connected = s.players.filter((p) => p.connected).length;
+  let content = "",
+    controls = "";
+  if (s.status === "lobby") {
+    content = `<div class="teacher-cards"><div class="teacher-card"><div class="tiny-cap">STUDENTS IN LOBBY</div><div class="teacher-stat">${count}</div><p class="teacher-hint">${connected} online · students appear automatically</p></div><div class="teacher-card"><div class="tiny-cap">JOIN ADDRESS</div><h3>${h(location.host)}</h3><p class="teacher-hint">Share the website and six-digit PIN.</p><button class="secondary-button" id="copy-link">COPY STUDENT LINK ↗</button></div></div><div class="teacher-card"><h3>Who's here?</h3><div class="teacher-avatar-tags">${count ? s.players.map((p) => `<span class="student-tag ${p.connected ? "" : "offline"}">${h(p.name)} ${p.connected ? "✓" : "· offline"}</span>`).join("") : '<p class="teacher-hint">Waiting for your first student…</p>'}</div></div>`;
+    controls = `<button class="primary-button" data-action="start" ${connected ? "" : "disabled"}>START GAME <span>→</span></button>`;
+  } else if (s.status === "question" || s.status === "reveal") {
+    const q = s.question,
+      done = s.status === "reveal";
+    content = `<div class="teacher-cards"><div class="teacher-card"><div class="tiny-cap">QUESTION ${q.number} / ${q.total} · ${q.type === "true-false" ? "TRUE / FALSE" : "MULTIPLE CHOICE"}</div><div class="teacher-stat" id="timer-seconds">${done ? "0" : "--"}s</div><div class="timer-bar"><div class="timer-fill" id="timer-fill" style="width:${done ? 0 : 100}%"></div></div></div><div class="teacher-card"><div class="tiny-cap">ANSWERS RECEIVED</div><div class="teacher-stat">${s.players.filter((p) => p.answered).length}<span style="font-size:22px;color:#a3abc5"> / ${count}</span></div><p class="teacher-hint">${connected} currently connected</p></div></div><div class="teacher-card"><div class="tiny-cap">${done ? "CORRECT ANSWER REVEALED" : "LIVE QUESTION"}</div><h2>${h(q.prompt)}</h2><div class="teacher-answers">${q.options.map((x, i) => `<div class="answer-option-${i} ${done && s.reveal.correct === i ? "correct-choice" : ""}"><span>${["◆", "▲", "●", "■"][i]} ${h(x)}</span><span>${done ? s.reveal.counts[i] + " votes" : ""}</span></div>`).join("")}</div></div>`;
+    const label = !done
+      ? "REVEAL ANSWER"
+      : s.questionIndex + 1 === s.totalQuestions
+        ? "SHOW PODIUM"
+        : "NEXT QUESTION";
+    controls = `<button class="primary-button" data-action="next">${label} <span>→</span></button>`;
+  } else if (s.status === "podium") {
+    content = `<div class="teacher-card teacher-podium" style="text-align:center"><div class="tiny-cap">OUR TOP THREE</div><h2>The Podium</h2>${podium(s.ranking)}</div>`;
+    controls =
+      '<button class="primary-button" data-action="next">SHOW FULL RESULTS <span>→</span></button>';
+  } else {
+    content = `<div class="teacher-card"><div class="tiny-cap">${s.status === "finished" ? "GAME FINISHED" : "COMPLETE CLASS RANKING"}</div><h2>Final Results</h2>${ranking(s.ranking || [])}</div>`;
+    controls =
+      s.status === "leaderboard"
+        ? '<button class="primary-button" data-action="next">FINISH GAME <span>✓</span></button>'
+        : '<a class="secondary-button" href="/dashboard">BACK TO MY QUIZZES →</a>';
   }
-  screen.innerHTML=`<section class="game-screen"><div class="teacher-top"><div><div class="eyebrow">${s.status==='lobby'?'✦ READY WHEN YOU ARE':s.status==='leaderboard'?'✦ GAME COMPLETE':'✦ LIVE ROUND IN PROGRESS'}</div><h1>${html(s.title)}</h1><p class="teacher-hint">${html(s.subtitle||'')} · ${s.totalQuestions} questions</p></div><div class="teacher-game-pin"><small>GAME PIN</small><strong>${html(s.pin)}</strong></div></div>${quiz}<div class="teacher-controls">${controls}<span class="teacher-hint">${s.status==='lobby'?'Players are waiting for you to press Start.':s.status==='question'?'The timer ends automatically, or reveal early.':s.status==='reveal'?'Students see the right answer. Press Next to continue.':s.status==='podium'?'Press Next for every student’s rank.':'Finished. You can create a new room.'}</span></div></section>`;
-  document.getElementById('copy-link')?.addEventListener('click',async()=>{
-    const url=`${location.origin}/join/${s.pin}`;
-    try{await navigator.clipboard.writeText(url);document.getElementById('copy-link').textContent='✓ LINK COPIED';}
-    catch{prompt('Copy this student link:',url)}
+  screen.innerHTML = `<section class="game-screen"><a class="teacher-title-link" href="/dashboard">← My quizzes</a><div class="teacher-top"><div><div class="eyebrow">${s.status === "lobby" ? "READY WHEN YOU ARE" : ["leaderboard", "finished"].includes(s.status) ? "EVERY WORD LEARNED IS A WIN" : "LIVE CLASSROOM"}</div><h1>${h(s.title)}</h1><p class="teacher-hint">${h(s.subtitle || "")} · ${s.totalQuestions} questions</p></div><div class="teacher-game-pin"><small>GAME PIN</small><strong>${h(s.pin)}</strong></div></div>${content}<div class="teacher-controls">${controls}<div class="teacher-actions-extra">${s.status !== "finished" ? '<button class="end-game-button" id="end-game">End game</button>' : ""}</div></div></section>`;
+  document.getElementById("copy-link")?.addEventListener("click", async () => {
+    const url = `${location.origin}/join/${pin}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      document.getElementById("copy-link").textContent = "✓ LINK COPIED";
+    } catch {
+      prompt("Copy this student link:", url);
+    }
   });
-  document.getElementById('game-start')?.addEventListener('click',()=>action('host:start'));
-  document.getElementById('game-next')?.addEventListener('click',()=>action('host:next'));
-  document.getElementById('new-game')?.addEventListener('click',()=>{localStorage.removeItem(STORAGE);showLogin()});
+  screen
+    .querySelectorAll("[data-action]")
+    .forEach(
+      (button) => (button.onclick = () => action(button.dataset.action)),
+    );
+  document.getElementById("end-game")?.addEventListener("click", () => {
+    if (confirm("End this game now? Students will see the current results."))
+      action("end");
+  });
   updateClock();
 }
-function action(event){
-  const btn=document.getElementById('game-next')||document.getElementById('game-start');if(btn)btn.disabled=true;
-  socket.timeout(6000).emit(event,{},(err,r)=>{
-    if(err||!r?.ok){alert(r?.message||'Action failed. Please try again.');if(btn)btn.disabled=false;}
+function action(action) {
+  if (!socket?.connected)
+    return notify("Connection lost. Wait for the server to reconnect.");
+  screen.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  const phaseId = state.phaseId;
+  socket.timeout(10000).emit(`host:${action}`, { phaseId }, (error, result) => {
+    if (error || !result?.ok) {
+      notify(result?.message || "Unable to reach the server. Please retry.");
+      render();
+      if (result?.status === 401)
+        notify(
+          "Your session expired. Log in in another tab, then refresh this screen.",
+        );
+    } else notify("");
   });
 }
-function updateClock(){
-  if(!state||state.status!=='question')return;
-  const remain=Math.max(0,state.question.endsAt-Date.now());const txt=document.getElementById('timer-seconds'),bar=document.getElementById('timer-fill');
-  if(txt)txt.textContent=Math.ceil(remain/1000)+'s';if(bar)bar.style.width=(100*remain/(state.question.duration*1000))+'%';
+function updateClock() {
+  if (state?.status !== "question") return;
+  const remaining = Math.max(
+    0,
+    state.question.endsAt - (Date.now() + clockOffset),
+  );
+  const label = document.getElementById("timer-seconds"),
+    bar = document.getElementById("timer-fill");
+  if (label) label.textContent = Math.ceil(remaining / 1000) + "s";
+  if (bar)
+    bar.style.width =
+      Math.min(100, (100 * remaining) / (state.question.duration * 1000)) + "%";
 }
-setInterval(updateClock,130);
-socket.on('game:state',s=>{state=s;render()});
-socket.on('connect',()=>{
-  const session=saved();
-  if(session?.pin&&session.hostToken){
-    socket.timeout(7000).emit('host:resume',session,(err,r)=>{
-      if(err){return;}if(!r?.ok){localStorage.removeItem(STORAGE);showLogin();}
+setInterval(updateClock, 120);
+WR.initialize()
+  .then((session) => {
+    if (!session.user) {
+      location.href = "/login";
+      return;
+    }
+    if (!/^\d{6}$/.test(pin || "")) {
+      location.href = "/dashboard";
+      return;
+    }
+    socket = io({ auth: { csrfToken: session.csrfToken } });
+    socket.on("game:state", (s) => {
+      state = s;
+      clockOffset = s.serverTime - Date.now();
+      render();
     });
-  }else if(!state)showLogin();
-  document.getElementById('offline-banner')?.remove();
-});
-socket.on('disconnect',()=>{if(!document.getElementById('offline-banner')){const div=document.createElement('div');div.className='connection-banner';div.id='offline-banner';div.textContent='Connection lost. Reconnecting…';document.body.prepend(div);}});
-if(!saved())showLogin();
+    socket.on("connect", () => {
+      notify("Restoring your game…");
+      socket
+        .timeout(10000)
+        .emit("host:resume", { pin }, (error, result) =>
+          notify(
+            error
+              ? "Could not restore the game. Refresh to retry."
+              : result?.ok
+                ? ""
+                : result?.message || "Game unavailable. Return to My quizzes.",
+          ),
+        );
+    });
+    socket.on("disconnect", () => notify("Connection lost. Reconnecting…"));
+    socket.on("connect_error", () => notify("Unable to connect. Retrying…"));
+    socket.on("game:expired", (data) => notify(data.message));
+  })
+  .catch((error) => notify(error.message));
