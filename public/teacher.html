@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#101326">
+  <title>WordRush · Teacher Control</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body class="teacher-body">
+  <div class="background-art"></div>
+  <div class="app-shell teacher-shell">
+    <header class="site-header"><a class="logo" href="/"><span class="logo-mark">W</span>WORD<span>RUSH</span><span class="logo-dot">.</span></a><span class="header-tag">TEACHER CONTROL ROOM ✦</span></header>
+    <main id="teacher-screen">
+      <section class="teacher-login-wrap">
+        <form id="create-form" class="panel login-panel"><div class="eyebrow">YOUR CLASSROOM, YOUR GAME</div><h1>Let's play.</h1><p>Pick a vocabulary set and create a live room. Students join using the six-digit PIN.</p><label for="password">TEACHER PASSWORD</label><input id="password" type="password" placeholder="Teacher access password" autocomplete="current-password" required><label for="quiz-selector">VOCABULARY SET</label><select id="quiz-selector" required><option value="">Loading quizzes…</option></select><p id="teacher-error" class="error-message" role="alert"></p><button type="submit" class="primary-button" id="create-button">CREATE LIVE ROOM <span>→</span></button><div class="card-footnote">Only game controls — no quiz editor needed.</div></form>
+      </section>
+    </main>
+    <footer class="site-footer"><span>WORDRUSH · LIVE CLASSROOM EDITION</span><a href="/">Student join page ↗</a></footer>
+  </div>
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/teacher.js" defer></script>
+</body>
+</html>
