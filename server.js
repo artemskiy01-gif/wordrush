@@ -1,199 +1,431 @@
-'use strict';
-const express = require('express');
-const { createServer } = require('http');
-const { Server } = require('socket.io');
-const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
+"use strict";
+require("dotenv").config({ quiet: true });
+const express = require("express");
+const { createServer } = require("node:http");
+const { Server } = require("socket.io");
+const { randomBytes, randomUUID } = require("node:crypto");
+const path = require("node:path");
+const fs = require("node:fs");
+const bcrypt = require("bcryptjs");
+const helmet = require("helmet");
+const { rateLimit } = require("express-rate-limit");
+const { openDatabase } = require("./lib/db");
+const { setupAuth, safeEqual, publicUser } = require("./lib/auth");
+const {
+  Problem,
+  normalizeQuiz,
+  requirePlayable,
+  playableErrors,
+  ownedQuiz,
+  fromRow,
+} = require("./lib/quizzes");
+const { GameEngine } = require("./lib/game");
+const route = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
 
-const app = express();
-const httpServer = createServer(app);
-const io = new Server(httpServer, { maxHttpBufferSize: 20_000 });
-const PORT = Number(process.env.PORT) || 3000;
-const ADMIN_PASSWORD = process.env.TEACHER_PASSWORD || crypto.randomBytes(12).toString('base64url');
-if (!process.env.TEACHER_PASSWORD) {
-  console.log('\n\u26a0\ufe0f  No TEACHER_PASSWORD secret set. Temporary teacher password: ' + ADMIN_PASSWORD);
-  console.log('Set TEACHER_PASSWORD in your hosting Secrets before sharing the site.\n');
-}
-const games = new Map();
-const makeToken = () => crypto.randomBytes(24).toString('hex');
-const roomName = pin => `game:${pin}`;
-const textTrim = (str, max) => typeof str === 'string' ? str.trim().slice(0, max) : '';
-const fail = (ack, message) => typeof ack === 'function' && ack({ ok: false, message });
-const ok = (ack, data={}) => typeof ack === 'function' && ack({ok: true, ...data});
-const secureEqual = (a,b) => {
-  const ab = Buffer.from(String(a || '')); const bb = Buffer.from(String(b || ''));
-  return ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
-};
-function loadQuizzes(){
-  const folder=path.join(__dirname,'quizzes');
-  return fs.readdirSync(folder).filter(f=>f.endsWith('.json')).map(f=>{
-    const quiz=JSON.parse(fs.readFileSync(path.join(folder,f),'utf8'));
-    if (!/^[\w-]{2,60}$/.test(quiz.id) || !quiz.title || !Array.isArray(quiz.questions) || quiz.questions.length<1 || quiz.questions.length>100) throw Error('Bad quiz file '+f);
-    if (!(Number.isInteger(quiz.duration) && quiz.duration >= 5 && quiz.duration <= 120)) throw Error('Bad duration in '+f);
-    quiz.questions.forEach((q, i)=>{
-      if (typeof q.prompt !== 'string' || q.prompt.length>300 || !Array.isArray(q.options) || q.options.length!==4 || q.options.some(x=>typeof x!=='string' || x.length>150) || !Number.isInteger(q.correct) || q.correct<0 || q.correct>3) throw Error('Bad question '+(i+1)+' in '+f);
+async function createApplication(options = {}) {
+  const production = process.env.NODE_ENV === "production",
+    appUrl = process.env.APP_URL;
+  if (production && (!appUrl || !appUrl.startsWith("https://")))
+    throw Error("Set APP_URL to the public HTTPS URL.");
+  let secret = options.secret || process.env.SESSION_SECRET;
+  if (!secret && !production) {
+    const file = path.join(__dirname, ".data", "session-secret");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    if (!fs.existsSync(file))
+      fs.writeFileSync(file, randomBytes(48).toString("hex"), { mode: 0o600 });
+    secret = fs.readFileSync(file, "utf8");
+  }
+  if (!secret || secret.length < 32)
+    throw Error("SESSION_SECRET must contain at least 32 random characters.");
+  const db = options.db || (await openDatabase(options.database));
+  const config = {
+    production,
+    secret,
+    origin: (req) =>
+      appUrl ? new URL(appUrl).origin : `${req.protocol}://${req.get("host")}`,
+  };
+  const app = express(),
+    httpServer = createServer(app);
+  app.disable("x-powered-by");
+  if (production) app.set("trust proxy", 1);
+  app.use(
+    helmet({
+      contentSecurityPolicy: {
+        directives: {
+          "script-src": ["'self'"],
+          "style-src": ["'self'", "'unsafe-inline'"],
+          "font-src": ["'self'"],
+          "connect-src": ["'self'"],
+          "img-src": ["'self'", "data:"],
+          "upgrade-insecure-requests": production ? [] : null,
+        },
+      },
+      strictTransportSecurity: production ? undefined : false,
+    }),
+  );
+  app.use(express.json({ limit: "2mb" }));
+  const auth = await setupAuth(app, db, config);
+  auth.safeEqual = safeEqual;
+  app.use("/api", (_req, res, next) => {
+    res.set("Cache-Control", "no-store");
+    next();
+  });
+  const limiter = (windowMs, limit, message) =>
+    rateLimit({
+      windowMs,
+      limit: options.test ? 2000 : limit,
+      standardHeaders: "draft-8",
+      legacyHeaders: false,
+      message: { message },
     });
-    return quiz;
+  const authLimiter = limiter(
+    900000,
+    35,
+    "Too many login attempts. Try again in 15 minutes.",
+  );
+  const signupLimiter = limiter(
+    3600000,
+    10,
+    "Too many registrations. Try again later.",
+  );
+  const writes = limiter(
+    60000,
+    150,
+    "Please wait a moment before trying again.",
+  );
+  app.get("/api/session", (req, res) =>
+    res.json({ user: req.user || null, csrfToken: auth.csrfToken(req) }),
+  );
+  app.post(
+    "/api/auth/signup",
+    signupLimiter,
+    auth.csrf,
+    route(async (req, res) => {
+      const { name, email, password, confirmPassword } = req.body || {};
+      if (
+        typeof name !== "string" ||
+        name.trim().length < 2 ||
+        name.trim().length > 80
+      )
+        throw new Problem(422, "Enter a display name of 2–80 characters.");
+      if (
+        typeof email !== "string" ||
+        email.length > 254 ||
+        !/^\S+@[^\s@]+\.[^\s@]+$/.test(email.trim())
+      )
+        throw new Problem(422, "Enter a valid email address.");
+      if (
+        typeof password !== "string" ||
+        password.length < 12 ||
+        Buffer.byteLength(password) > 72
+      )
+        throw new Problem(
+          422,
+          "Use at least 12 characters and no more than 72 bytes for your password.",
+        );
+      if (password !== confirmPassword)
+        throw new Problem(422, "Your passwords do not match.");
+      const hash = await bcrypt.hash(password, 12);
+      let user;
+      try {
+        user = (
+          await db.query(
+            "INSERT INTO teachers(id,name,email,password_hash) VALUES($1,$2,$3,$4) RETURNING *",
+            [randomUUID(), name.trim(), email.trim().toLowerCase(), hash],
+          )
+        ).rows[0];
+      } catch (error) {
+        if (error.code === "23505")
+          throw new Problem(409, "An account with this email already exists.");
+        throw error;
+      }
+      await new Promise((resolve, reject) =>
+        req.logIn(publicUser(user), (error) =>
+          error ? reject(error) : resolve(),
+        ),
+      );
+      const csrfToken = auth.csrfToken(req);
+      await new Promise((resolve, reject) =>
+        req.session.save((error) => (error ? reject(error) : resolve())),
+      );
+      res.status(201).json({ user: req.user, csrfToken });
+    }),
+  );
+  app.post("/api/auth/login", authLimiter, auth.csrf, (req, res, next) => {
+    auth.passport.authenticate("local", (error, user) => {
+      if (error) return next(error);
+      if (!user)
+        return next(new Problem(401, "Email or password is incorrect."));
+      req.logIn(user, (error) => {
+        if (error) return next(error);
+        const csrfToken = auth.csrfToken(req);
+        req.session.save((error) =>
+          error ? next(error) : res.json({ user, csrfToken }),
+        );
+      });
+    })(req, res, next);
   });
-}
-const quizzes=loadQuizzes();
-if (!quizzes.length) throw Error('Provide at least one quiz JSON in quizzes/');
-const publicQuizzes=quizzes.map(q=>({id:q.id,title:q.title,subtitle:q.subtitle,questions:q.questions.length,duration:q.duration}));
-function newPin(){
-  for(let i=0;i<50;i++){
-    const pin=String(crypto.randomInt(100000,1000000));
-    if(!games.has(pin))return pin;
+  app.post(
+    "/api/auth/logout",
+    auth.requireUser,
+    auth.csrf,
+    route(async (req, res) => {
+      await new Promise((resolve, reject) =>
+        req.session.destroy((error) => (error ? reject(error) : resolve())),
+      );
+      res.clearCookie("wordrush.sid", {
+        path: "/",
+        httpOnly: true,
+        sameSite: "lax",
+        secure: production,
+      });
+      res.json({ ok: true });
+    }),
+  );
+  app.use("/api/quizzes", auth.requireUser);
+  app.get(
+    "/api/quizzes",
+    route(async (req, res) => {
+      const result = await db.query(
+        "SELECT * FROM quizzes WHERE owner_id=$1 ORDER BY updated_at DESC",
+        [req.user.id],
+      );
+      res.json(
+        result.rows.map((row) => {
+          const q = fromRow(row);
+          return {
+            ...q,
+            questions: undefined,
+            questionCount: q.questions.length,
+            playable: playableErrors(q).length === 0,
+          };
+        }),
+      );
+    }),
+  );
+  async function insertQuiz(owner, q) {
+    const result = await db.query(
+      "INSERT INTO quizzes(id,owner_id,title,description,status,questions) VALUES($1,$2,$3,$4,$5,$6::jsonb) RETURNING *",
+      [
+        randomUUID(),
+        owner,
+        q.title,
+        q.description,
+        "draft",
+        JSON.stringify(q.questions),
+      ],
+    );
+    return fromRow(result.rows[0]);
   }
-  throw Error('PIN space exhausted');
-}
-function playersList(game){
-  return [...game.players.values()].map(p=>({name:p.name,score:p.score,connected:p.connected,answered:p.lastAnswered === game.questionIndex,answerCount:p.answerCount,correctCount:p.correctCount}));
-}
-function ranks(game){
-  return [...game.players.values()].sort((a,b)=>b.score-a.score || b.correctCount-a.correctCount || a.joinedAt-b.joinedAt || a.name.localeCompare(b.name)).map((p,i)=>({rank:i+1,name:p.name,score:p.score,correctCount:p.correctCount,answerCount:p.answerCount}));
-}
-function publicState(game, token, isHost){
-  const common={pin:game.pin,title:game.quiz.title,subtitle:game.quiz.subtitle,status:game.status,questionIndex:game.questionIndex,totalQuestions:game.quiz.questions.length,players:playersList(game),isHost};
-  if(game.status==='question' || game.status==='reveal'){
-    const q=game.quiz.questions[game.questionIndex];
-    common.question={prompt:q.prompt,options:q.options,number:game.questionIndex+1,total:game.quiz.questions.length,endsAt:game.endsAt,duration:game.quiz.duration};
-    if(game.status==='reveal')common.reveal={correct:q.correct,counts:[0,1,2,3].map(i=>[...game.players.values()].filter(p=>p.answers[game.questionIndex]?.selected===i).length)};
-  }
-  if(game.status==='podium')common.ranking=ranks(game).slice(0,3);
-  if(game.status==='leaderboard')common.ranking=ranks(game);
-  if(!isHost){
-    const p=game.players.get(token);
-    common.me=p?{name:p.name,score:p.score,lastAnswer: p.answers[game.questionIndex] ? (game.status==='question' ? {selected:p.answers[game.questionIndex].selected} : p.answers[game.questionIndex]) : null}:null;
-    // Never reveal the answer or other students' selections before reveal.
-  }
-  return common;
-}
-function emitState(game){
-  const host=io.sockets.sockets.get(game.hostSocketId);
-  if(host)host.emit('game:state',publicState(game,game.hostToken,true));
-  for(const [token,player] of game.players){
-    const sock=io.sockets.sockets.get(player.socketId);
-    if(sock)sock.emit('game:state',publicState(game,token,false));
-  }
-}
-function clearTimer(game){if(game.timer) clearTimeout(game.timer);game.timer=null;}
-function reveal(game){
-  if(game.status!=='question')return;
-  clearTimer(game);game.status='reveal';emitState(game);
-}
-function nextQuestion(game){
-  clearTimer(game);
-  game.questionIndex++;
-  game.status='question';
-  game.endsAt=Date.now()+game.quiz.duration*1000;
-  emitState(game);
-  game.timer=setTimeout(()=>reveal(game),game.quiz.duration*1000);
-}
-function pruneExpiredGames(){
-  const now=Date.now();
-  for(const [pin,g] of games){
-    if(now-g.createdAt > 24*60*60*1000){clearTimer(g);games.delete(pin);}
-  }
-}
-setInterval(pruneExpiredGames,60*60*1000).unref();
-app.disable('x-powered-by');
-app.use(express.static(path.join(__dirname,'public'),{ extensions:['html'] }));
-app.get('/health',(_req,res)=>res.json({status:'ok',quizCount:quizzes.length}));
-app.get('/api/quizzes',(_req,res)=>res.json(publicQuizzes));
-app.get('/join/:pin',(req,res)=>res.redirect('/?pin='+encodeURIComponent(req.params.pin)));
-app.get('/teacher',(_req,res)=>res.sendFile(path.join(__dirname,'public','teacher.html')));
-
-io.on('connection', socket=>{
-  const member = {pin:null,role:null,token:null};
-  function attach(game,role,token){
-    if(member.pin)socket.leave(roomName(member.pin));
-    member.pin=game.pin;member.role=role;member.token=token;
-    socket.join(roomName(game.pin));
-  }
-  socket.on('host:create',(payload={},ack)=>{
-    if(!secureEqual(payload.password,ADMIN_PASSWORD))return fail(ack,'Incorrect teacher password.');
-    const quiz=quizzes.find(q=>q.id===payload.quizId);
-    if(!quiz)return fail(ack,'Choose an available quiz.');
-    const pin=newPin(), hostToken=makeToken();
-    const game={pin,quiz,hostToken,hostSocketId:socket.id,players:new Map(),status:'lobby',questionIndex:-1,endsAt:null,timer:null,createdAt:Date.now()};
-    games.set(pin,game);attach(game,'host',hostToken);
-    ok(ack,{pin,hostToken});emitState(game);
+  app.post(
+    "/api/quizzes",
+    writes,
+    auth.csrf,
+    route(async (req, res) =>
+      res
+        .status(201)
+        .json(await insertQuiz(req.user.id, normalizeQuiz(req.body))),
+    ),
+  );
+  app.post(
+    "/api/quizzes/import-sample",
+    writes,
+    auth.csrf,
+    route(async (req, res) => {
+      const sample = JSON.parse(
+        fs.readFileSync(
+          path.join(__dirname, "quizzes", "holidays-2a.json"),
+          "utf8",
+        ),
+      );
+      const q = normalizeQuiz({
+        title: sample.title,
+        description: sample.subtitle,
+        questions: sample.questions.map((q) => ({
+          ...q,
+          type: "multiple-choice",
+          duration: sample.duration,
+        })),
+      });
+      res.status(201).json(await insertQuiz(req.user.id, q));
+    }),
+  );
+  app.get(
+    "/api/quizzes/:id",
+    route(async (req, res) =>
+      res.json(await ownedQuiz(db, req.params.id, req.user.id)),
+    ),
+  );
+  app.put(
+    "/api/quizzes/:id",
+    writes,
+    auth.csrf,
+    route(async (req, res) => {
+      const original = await ownedQuiz(db, req.params.id, req.user.id),
+        q = normalizeQuiz(req.body);
+      if (
+        !Number.isInteger(req.body.revision) ||
+        req.body.revision !== original.revision
+      )
+        throw new Problem(
+          409,
+          "This quiz changed in another tab. Copy your edits, then reload before saving.",
+        );
+      const status = req.body.status === "published" ? "published" : "draft";
+      if (status === "published") requirePlayable(q);
+      const result = await db.query(
+        "UPDATE quizzes SET title=$3,description=$4,status=$5,questions=$6::jsonb,revision=revision+1,updated_at=CURRENT_TIMESTAMP,published_at=CASE WHEN $5='published' THEN CURRENT_TIMESTAMP ELSE NULL END WHERE id=$1 AND owner_id=$2 AND revision=$7 RETURNING *",
+        [
+          original.id,
+          req.user.id,
+          q.title,
+          q.description,
+          status,
+          JSON.stringify(q.questions),
+          original.revision,
+        ],
+      );
+      if (!result.rows[0])
+        throw new Problem(
+          409,
+          "This quiz changed in another tab. Reload before saving.",
+        );
+      res.json(fromRow(result.rows[0]));
+    }),
+  );
+  app.post(
+    "/api/quizzes/:id/duplicate",
+    writes,
+    auth.csrf,
+    route(async (req, res) => {
+      const q = await ownedQuiz(db, req.params.id, req.user.id);
+      res.status(201).json(
+        await insertQuiz(req.user.id, {
+          ...q,
+          title: `${q.title || "Untitled quiz"} (copy)`.slice(0, 180),
+          questions: q.questions.map((q) => ({ ...q, id: randomUUID() })),
+        }),
+      );
+    }),
+  );
+  app.delete(
+    "/api/quizzes/:id",
+    writes,
+    auth.csrf,
+    route(async (req, res) => {
+      const q = await ownedQuiz(db, req.params.id, req.user.id);
+      await db.query("DELETE FROM quizzes WHERE id=$1 AND owner_id=$2", [
+        q.id,
+        req.user.id,
+      ]);
+      res.json({ ok: true });
+    }),
+  );
+  const io = new Server(httpServer, {
+    maxHttpBufferSize: 20000,
+    allowRequest: (req, done) => {
+      const expected = appUrl
+        ? new URL(appUrl).origin
+        : `http://${req.headers.host}`;
+      done(null, !req.headers.origin || req.headers.origin === expected);
+    },
   });
-  socket.on('host:resume',(payload={},ack)=>{
-    const pin=textTrim(payload.pin,6);const game=games.get(pin);
-    if(!game || !secureEqual(payload.hostToken,game.hostToken))return fail(ack,'Host session expired. Create a new game.');
-    game.hostSocketId=socket.id;attach(game,'host',game.hostToken);
-    ok(ack,{pin,hostToken:game.hostToken});emitState(game);
+  io.engine.use(auth.middleware);
+  const engine = new GameEngine(io, db, auth);
+  await engine.initialize();
+  app.post(
+    "/api/quizzes/:id/host",
+    writes,
+    auth.csrf,
+    route(async (req, res) => {
+      const g = await engine.create(req.user.id, req.params.id);
+      res.status(201).json({ pin: g.pin });
+    }),
+  );
+  app.get("/api/games", auth.requireUser, (req, res) =>
+    res.json(
+      [...engine.games.values()]
+        .filter((g) => g.hostId === req.user.id)
+        .map((g) => ({
+          pin: g.pin,
+          title: g.quiz.title,
+          status: g.status,
+          createdAt: g.createdAt,
+        })),
+    ),
+  );
+  app.get(
+    "/health",
+    route(async (_req, res) => {
+      await db.query("SELECT 1");
+      res.json({ status: "ok", version: "2.0.0" });
+    }),
+  );
+  app.get("/join/:pin", (req, res) =>
+    res.redirect("/?pin=" + encodeURIComponent(req.params.pin)),
+  );
+  const publicPath = path.join(__dirname, "public");
+  const teacherPage = (req, res) =>
+    req.user
+      ? res.sendFile(path.join(publicPath, "platform.html"))
+      : res.redirect("/login");
+  app.get(
+    ["/dashboard", "/account", "/quizzes/new", "/quizzes/:id/edit"],
+    teacherPage,
+  );
+  app.get(["/signup", "/login"], (req, res) =>
+    req.user
+      ? res.redirect("/dashboard")
+      : res.sendFile(path.join(publicPath, "platform.html")),
+  );
+  app.get(["/teacher", "/teacher.html"], (req, res) =>
+    req.user
+      ? res.sendFile(path.join(publicPath, "teacher.html"))
+      : res.redirect("/login"),
+  );
+  app.use(express.static(publicPath, { index: "index.html" }));
+  app.use("/api", (_req, _res, next) => next(new Problem(404, "Not found.")));
+  app.use((error, _req, res, _next) => {
+    const status = error.status || 500;
+    if (status >= 500)
+      console.error("Request failed:", error.code || error.name);
+    res.status(status).json({
+      message:
+        status >= 500
+          ? "The service is temporarily unavailable. Please retry."
+          : error.message,
+      details: error.details,
+    });
   });
-  socket.on('player:join',(payload={},ack)=>{
-    const pin=textTrim(payload.pin,6),name=textTrim(payload.name,24).replace(/[<>\u0000-\u001f]/g,'');
-    const game=games.get(pin);
-    if(!/^\d{6}$/.test(pin)||!game)return fail(ack,'Game not found. Check the six-digit PIN.');
-    if(name.length<2)return fail(ack,'Please enter a name (at least 2 characters).');
-    if(game.status!=='lobby')return fail(ack,'This game has already started.');
-    if(game.players.size >= 80)return fail(ack,'This game is full (80 students).');
-    if([...game.players.values()].some(p=>p.name.toLowerCase()===name.toLowerCase()))return fail(ack,'That name is taken. Choose another.');
-    const token=makeToken();
-    const player={name,token,socketId:socket.id,connected:true,joinedAt:Date.now(),score:0,lastAnswered:-1,answerCount:0,correctCount:0,answers:{}};
-    game.players.set(token,player);attach(game,'player',token);
-    ok(ack,{pin,playerToken:token,name});emitState(game);
-  });
-  socket.on('player:resume',(payload={},ack)=>{
-    const pin=textTrim(payload.pin,6),game=games.get(pin),token=textTrim(payload.playerToken,100);
-    if(!game || !game.players.has(token))return fail(ack,'Previous game session not found.');
-    const player=game.players.get(token);
-    player.connected=true;player.socketId=socket.id;
-    attach(game,'player',token);
-    ok(ack,{pin,name:player.name});emitState(game);
-  });
-  function hostAction(action,ack){
-    const game=games.get(member.pin);
-    if(!game || member.role!=='host' || !secureEqual(member.token,game.hostToken) || game.hostSocketId!==socket.id)return fail(ack,'Not authorized as teacher.');
-    if(action==='start'){
-      if(game.status!=='lobby')return fail(ack,'The game already started.');
-      if(game.players.size===0)return fail(ack,'Wait until at least one student joins.');
-      nextQuestion(game);
-    }else if(action==='next'){
-      if(game.status==='question')reveal(game);
-      else if(game.status==='reveal'){
-        if(game.questionIndex+1<game.quiz.questions.length)nextQuestion(game);
-        else{game.status='podium';emitState(game);}
-      }else if(game.status==='podium'){
-        game.status='leaderboard';emitState(game);
-      }else return fail(ack,'Nothing to advance yet.');
-    }else return fail(ack,'Unknown teacher action.');
-    ok(ack);
-  }
-  socket.on('host:start',(_payload,ack)=>hostAction('start',ack));
-  socket.on('host:next',(_payload,ack)=>hostAction('next',ack));
-  socket.on('player:answer',(payload={},ack)=>{
-    const game=games.get(member.pin);
-    if(!game || member.role!=='player' || !game.players.has(member.token))return fail(ack,'You are not in a game.');
-    const player=game.players.get(member.token);
-    if(player.socketId!==socket.id)return fail(ack,'Reconnected on another tab.');
-    if(game.status!=='question' || Date.now()>game.endsAt)return fail(ack,'Answer window has closed.');
-    if(player.answers[game.questionIndex])return fail(ack,'Answer already submitted.');
-    const selected=payload.selected;
-    if(!Number.isInteger(selected)||selected<0||selected>3)return fail(ack,'Invalid answer.');
-    const q=game.quiz.questions[game.questionIndex],correct=selected===q.correct;
-    const timeRemaining=Math.max(0,game.endsAt-Date.now());
-    const points=correct?Math.round(500+500*timeRemaining/(game.quiz.duration*1000)):0;
-    player.answers[game.questionIndex]={selected,correct,points};
-    player.score+=points;player.lastAnswered=game.questionIndex;player.answerCount++;
-    if(correct)player.correctCount++;
-    ok(ack,{selected});emitState(game);
-    if([...game.players.values()].every(p=>p.answers[game.questionIndex]))reveal(game);
-  });
-  socket.on('disconnect',()=>{
-    const game=games.get(member.pin);
-    if(!game)return;
-    if(member.role==='player'){
-      const p=game.players.get(member.token);
-      if(p && p.socketId===socket.id){p.connected=false;p.socketId=null;emitState(game);}
-    }else if(member.role==='host' && game.hostSocketId===socket.id){game.hostSocketId=null;}
-  });
-});
-
-if(require.main===module)httpServer.listen(PORT,'0.0.0.0',()=>console.log(`WordRush listening on http://localhost:${PORT}`));
-module.exports={app,httpServer,io,games,quizzes};
+  return {
+    app,
+    httpServer,
+    io,
+    db,
+    engine,
+    async close() {
+      await engine.close();
+      await new Promise((resolve) => io.close(resolve));
+      httpServer.closeAllConnections?.();
+      if (!options.db) await db.close();
+    },
+  };
+}
+if (require.main === module)
+  createApplication()
+    .then((instance) => {
+      const port = Number(process.env.PORT) || 3000;
+      instance.httpServer.listen(port, "0.0.0.0", () =>
+        console.log(`WordRush 2.0 listening on http://localhost:${port}`),
+      );
+      for (const signal of ["SIGTERM", "SIGINT"])
+        process.once(signal, () =>
+          instance.close().then(() => process.exit(0)),
+        );
+    })
+    .catch((error) => {
+      console.error("Startup failed:", error.message);
+      process.exitCode = 1;
+    });
+module.exports = { createApplication };
