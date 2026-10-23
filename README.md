@@ -2,6 +2,8 @@
 
 A real-time classroom quiz platform, upgraded from the original WordRush vocabulary game. Teachers have their own accounts and private quiz library. Students join on their phones with a six-digit PIN and a nickname.
 
+The upgrade is published in [artemskiy01-gif/wordrush](https://github.com/artemskiy01-gif/wordrush/tree/codex/wordrush-2-platform), with [pull request #1](https://github.com/artemskiy01-gif/wordrush/pull/1) tracking the change. The earlier single-teacher project remains its upstream source.
+
 ## Run locally
 
 Use Node.js 20+ (Node 22 recommended).

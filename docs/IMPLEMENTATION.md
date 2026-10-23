@@ -18,13 +18,14 @@ Implemented and checked on 24 October 2026 against original commit `6ecf94a6664c
 
 Environment: Windows, Node 20.20.0 and npm 10.8.2.
 
-| Check                         | Result                                                                                   |
-| ----------------------------- | ---------------------------------------------------------------------------------------- |
-| `npm test`                    | 9 tests passed, zero failures                                                            |
-| `npm run check`               | All 14 JavaScript files passed syntax checks                                             |
-| Dependency installation/audit | Zero known vulnerabilities reported for installed dependencies                           |
-| Prettier check                | Passed for application code, tests, HTML/CSS, configuration and maintained documentation |
-| Migration command             | Passed against the persistent local PostgreSQL data directory                            |
+| Check                         | Result                                                                                                                        |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `npm test`                    | 9 tests passed, zero failures                                                                                                 |
+| `npm run check`               | All 14 JavaScript files passed syntax checks                                                                                  |
+| Dependency installation/audit | Zero known vulnerabilities reported for installed dependencies                                                                |
+| Prettier check                | Passed for application code, tests, HTML/CSS, configuration and maintained documentation                                      |
+| Migration command             | Passed against the persistent local PostgreSQL data directory                                                                 |
+| GitHub Actions                | Passed on Node 22 on Windows and Ubuntu; [verified run](https://github.com/artemskiy01-gif/wordrush/actions/runs/40038933848) |
 
 The test command covers more than one assertion/scenario per named test:
 
@@ -62,7 +63,7 @@ Local evidence images are in `artifacts/`: teacher dashboard, mobile editor and 
 
 ## Deployment and external services
 
-The upgraded application is running locally. It has not been deployed to a public URL. Public GitHub read access was available; authenticated GitHub/Render integrations were not connected when checked. Connection suggestions were made so remote publication can continue after authorization.
+The upgraded application is running locally. Source is published in the user's [WordRush fork](https://github.com/artemskiy01-gif/wordrush/tree/codex/wordrush-2-platform), with the upgrade proposed in [pull request #1](https://github.com/artemskiy01-gif/wordrush/pull/1). The original repository is retained as the local `upstream` remote. GitHub Actions has verified the upgrade on Windows and Ubuntu with Node 22. No public application deployment has been verified yet.
 
 Production needs a durable PostgreSQL service, a long random `SESSION_SECRET`, `APP_URL` set to the public HTTPS origin and `NODE_ENV=production`. See `render.yaml` and the README. Startup applies the database migrations. The external PostgreSQL adapter and real production TLS/WebSocket path must be exercised against that chosen service; current database tests use actual embedded PostgreSQL through PGlite.
 
